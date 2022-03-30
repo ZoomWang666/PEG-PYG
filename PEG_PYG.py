@@ -1,44 +1,19 @@
-import torch.nn.functional as F
-from utils import *
-from dataset import *
+import math
 
-class Net(torch.nn.Module):
-    def __init__(self, feats_dim, pos_dim, use_former_information = True, update_coors=True):
-        super(Net, self).__init__()
-        
-        self.feats_dim = feats_dim
-        self.pos_dim = pos_dim
-        self.use_former_information = use_former_information
-        self.update_coors = update_coors
-        
-        self.conv1 = PEG_layer(feats_dim = feats_dim, pos_dim = pos_dim,
-                               use_formerinfo = use_former_information, update_coors = update_coors)
-        self.conv2 = PEG_layer(feats_dim = feats_dim, pos_dim = pos_dim,
-                               use_formerinfo = use_former_information, update_coors = update_coors)
-        self.loss_fn = torch.nn.BCEWithLogitsLoss()
-        self.fc = nn.Linear(2, 1)
-        #self.output = nn.Linear(4,1)
-
-    def forward(self, x, edge_index, idx):
-
-        x = self.conv1(x, edge_index)
-        x = self.conv2(x, edge_index)
-        pos_dim = self.pos_dim
-        
-        nodes_first = x[ : , pos_dim: ][idx[0]]
-        nodes_second = x[ : , pos_dim: ][idx[1]]
-        pos_first = x[ : , :pos_dim ][idx[0]]
-        pos_second = x[ : , :pos_dim ][idx[1]]
-        
-        positional_encoding = ((pos_first - pos_second)**2).sum(dim=-1, keepdim=True)
-
-        pred = torch.sum(nodes_first * nodes_second, dim=-1)
-        out = self.fc(torch.cat([pred.reshape(len(pred), 1),positional_encoding.reshape(len(positional_encoding), 1)], 1))
-
-        return out
-
-    def loss(self, pred, link_label):
-        return self.loss_fn(pred, link_label)
+from typing import Optional, Tuple
+from torch_geometric.typing import Adj, OptTensor, PairTensor
+import torch
+from torch import nn, einsum, broadcast_tensors
+import torch
+from torch import Tensor
+from torch.nn import Parameter
+from torch_geometric.nn.conv.gcn_conv import gcn_norm
+from torch_scatter import scatter_add
+from torch_sparse import SparseTensor, matmul, fill_diag, sum as sparsesum, mul
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.utils import add_remaining_self_loops
+from torch_geometric.utils.num_nodes import maybe_num_nodes
+from torch_geometric.typing import Adj, Size, OptTensor, Tensor
 
 def glorot(tensor):
     if tensor is not None:
@@ -49,23 +24,6 @@ def glorot(tensor):
 def zeros(tensor):
     if tensor is not None:
         tensor.data.fill_(0)
-
-import math
-
-from typing import Optional, Tuple
-from torch_geometric.typing import Adj, OptTensor, PairTensor
-import torch
-from torch import nn, einsum, broadcast_tensors
-import torch
-from torch import Tensor
-from torch.nn import Parameter
-from torch_scatter import scatter_add
-from torch_sparse import SparseTensor, matmul, fill_diag, sum as sparsesum, mul
-from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import add_remaining_self_loops
-from torch_geometric.utils.num_nodes import maybe_num_nodes
-from torch_geometric.typing import Adj, Size, OptTensor, Tensor
-
 class CoorsNorm(nn.Module):
     def __init__(self, eps = 1e-8):
         super().__init__()
@@ -77,51 +35,19 @@ class CoorsNorm(nn.Module):
         normed_coors = coors / norm.clamp(min = self.eps)
         phase = self.fn(norm)
         return (phase * normed_coors)
+
     
-def gcn_norm(edge_index, edge_weight=None, num_nodes=None, improved=False,
-             add_self_loops=True, dtype=None):
-
-    fill_value = 2. if improved else 1.
-
-    if isinstance(edge_index, SparseTensor):
-        adj_t = edge_index
-        if not adj_t.has_value():
-            adj_t = adj_t.fill_value(1., dtype=dtype)
-        if add_self_loops:
-            adj_t = fill_diag(adj_t, fill_value)
-        deg = sparsesum(adj_t, dim=1)
-        deg_inv_sqrt = deg.pow_(-0.5)
-        deg_inv_sqrt.masked_fill_(deg_inv_sqrt == float('inf'), 0.)
-        adj_t = mul(adj_t, deg_inv_sqrt.view(-1, 1))
-        adj_t = mul(adj_t, deg_inv_sqrt.view(1, -1))
-        return adj_t
-
-    else:
-        num_nodes = maybe_num_nodes(edge_index, num_nodes)
-
-        if edge_weight is None:
-            edge_weight = torch.ones((edge_index.size(1), ), dtype=dtype,
-                                     device=edge_index.device)
-
-        if add_self_loops:
-            edge_index, tmp_edge_weight = add_remaining_self_loops(
-                edge_index, edge_weight, fill_value, num_nodes)
-            assert tmp_edge_weight is not None
-            edge_weight = tmp_edge_weight
-
-        row, col = edge_index[0], edge_index[1]
-        deg = scatter_add(edge_weight, col, dim=0, dim_size=num_nodes)
-        deg_inv_sqrt = deg.pow_(-0.5)
-        deg_inv_sqrt.masked_fill_(deg_inv_sqrt == float('inf'), 0)
-        return edge_index, deg_inv_sqrt[row] * edge_weight * deg_inv_sqrt[col]
-
-
-class PEG_layer(MessagePassing):
-    """
-
+class PEG_conv(MessagePassing):
+    
+    r"""The PEG layer from the `"Equivariant and Stable Positional Encoding for More Powerful Graph Neural Networks" <https://arxiv.org/abs/2203.00199>`_ paper
+    
+    
     Args:
-        feats_dim (int): Size of node features.
+        in_feats_dim (int): Size of input node features.
         pos_dim (int): Size of positional encoding.
+        out_feats_dim (int): Size of output node features.
+        edge_mlp_dim (int): We use MLP to make one to one mapping between the relative information and edge weight. 
+                            edge_mlp_dim represents the hidden units dimension in the MLP. (default: 32)
         improved (bool, optional): If set to :obj:`True`, the layer computes
             :math:`\mathbf{\hat{A}}` as :math:`\mathbf{A} + 2\mathbf{I}`.
             (default: :obj:`False`)
@@ -145,16 +71,17 @@ class PEG_layer(MessagePassing):
             :class:`torch_geometric.nn.conv.MessagePassing`.
     """
 
-    def __init__(self, feats_dim: int, pos_dim: int,
+    def __init__(self, in_feats_dim: int, pos_dim: int, out_feats_dim: int, edge_mlp_dim: int = 32,
                  improved: bool = False, cached: bool = False,
                  add_self_loops: bool = True, normalize: bool = True,
                  bias: bool = True, update_coors: bool = False,
                  use_formerinfo: bool = False, norm_coors = True, **kwargs):
 
         kwargs.setdefault('aggr', 'add')
-        super(PEG_layer, self).__init__(**kwargs)
+        super(PEG_conv, self).__init__(**kwargs)
 
-        self.feats_dim = feats_dim
+        self.in_feats_dim = in_feats_dim
+        self.out_feats_dim = out_feats_dim
         self.pos_dim = pos_dim
         self.update_coors = update_coors
         self.use_formerinfo = use_formerinfo
@@ -162,24 +89,23 @@ class PEG_layer(MessagePassing):
         self.cached = cached
         self.add_self_loops = add_self_loops
         self.normalize = normalize
-        
+        self.edge_mlp_dim = edge_mlp_dim
         self.coors_norm = CoorsNorm() if norm_coors else nn.Identity()
 
         self._cached_edge_index = None
         self._cached_adj_t = None
         
-        self.edge_mlp1 = nn.Linear(1, 32)
-        self.edge_mlp2 = nn.Linear(32, 1)
-        #self.edge_mlp = nn.Linear(feats_dim + 1, feats_dim)
-        self.weight_withformer = Parameter(torch.Tensor(feats_dim + feats_dim, feats_dim))
-        self.weight_noformer = Parameter(torch.Tensor(feats_dim, feats_dim))
+        self.edge_mlp1 = nn.Linear(1, edge_mlp_dim)
+        self.edge_mlp2 = nn.Linear(edge_mlp_dim, 1)
+        self.weight_withformer = Parameter(torch.Tensor(in_feats_dim + in_feats_dim, out_feats_dim))
+        self.weight_noformer = Parameter(torch.Tensor(in_feats_dim, out_feats_dim))
         self.coors_mlp = nn.Sequential(
             nn.Linear(pos_dim, pos_dim * 4),
             nn.Linear(pos_dim * 4, 1)
         ) if update_coors else None
 
         if bias:
-            self.bias = Parameter(torch.Tensor(feats_dim))
+            self.bias = Parameter(torch.Tensor(out_feats_dim))
         else:
             self.register_parameter('bias', None)
 
@@ -221,16 +147,18 @@ class PEG_layer(MessagePassing):
                         self._cached_adj_t = edge_index
                 else:
                     edge_index = cache
-
+        else:
+            print('We normalize the adjacent matrix in PEG.')
         
         
         rel_coors = coors[edge_index[0]] - coors[edge_index[1]]
+        neighbour_coors = coors[edge_index[1]]
         rel_dist  = (rel_coors ** 2).sum(dim=-1, keepdim=True)
 
         # propagate_type: (x: Tensor, edge_weight: OptTensor)
         # pos: l2 norms
         # rel_coors: used in updating positional encodings, not required for PEG
-        hidden_out, coors_out = self.propagate(edge_index, x = feats, edge_weight=edge_weight, pos=rel_dist, coors=coors, rel_coors=rel_coors,
+        hidden_out, coors_out = self.propagate(edge_index, x = feats, edge_weight=edge_weight, pos=rel_dist, coors=coors, rel_coors=rel_coors, neighbour_coors = neighbour_coors,
                              size=None)
         
         
@@ -242,10 +170,10 @@ class PEG_layer(MessagePassing):
 
 
     def message(self, x_i: Tensor, x_j: Tensor, edge_weight: OptTensor, pos) -> Tensor:
-        temp = self.edge_mlp1(pos)
-        temp = self.edge_mlp2(temp)
-        temp = torch.sigmoid(temp)
-        return x_j if edge_weight is None else temp * edge_weight.view(-1, 1) * x_j
+        PE_edge_weight = self.edge_mlp1(pos)
+        PE_edge_weight = self.edge_mlp2(PE_edge_weight)
+        PE_edge_weight = torch.sigmoid(PE_edge_weight)
+        return x_j if edge_weight is None else PE_edge_weight * edge_weight.view(-1, 1) * x_j
     
     def propagate(self, edge_index: Adj, size: Size = None, **kwargs):
         """The initial call to start propagating messages.
@@ -273,8 +201,8 @@ class PEG_layer(MessagePassing):
         # update coors if specified
         if self.update_coors:
             coor_wij = self.coors_mlp(m_ij)
-            kwargs["rel_coors"] = self.coors_norm(kwargs["rel_coors"])
-            mhat_i = self.aggregate(coor_wij * kwargs["rel_coors"], **aggr_kwargs)
+            kwargs["neighbour_coors"] = self.coors_norm(kwargs["neighbour_coors"])
+            mhat_i = self.aggregate(coor_wij * kwargs["neighbour_coors"], **aggr_kwargs)
             coors_out = kwargs["coors"] + mhat_i
         else:
             coors_out = kwargs["coors"]
