@@ -1,40 +1,15 @@
 import math
 
 from typing import Optional, Tuple
-from torch_geometric.typing import Adj, OptTensor, PairTensor
+from torch_geometric.typing import Adj, Size, OptTensor, Tensor
 import torch
-from torch import nn, einsum, broadcast_tensors
-import torch
+from torch import nn
 from torch import Tensor
 from torch.nn import Parameter
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
-from torch_scatter import scatter_add
-from torch_sparse import SparseTensor, matmul, fill_diag, sum as sparsesum, mul
+from torch_sparse import SparseTensor
 from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import add_remaining_self_loops
-from torch_geometric.utils.num_nodes import maybe_num_nodes
-from torch_geometric.typing import Adj, Size, OptTensor, Tensor
 
-def glorot(tensor):
-    if tensor is not None:
-        stdv = math.sqrt(6.0 / (tensor.size(-2) + tensor.size(-1)))
-        tensor.data.uniform_(-stdv, stdv)
-
-        
-def zeros(tensor):
-    if tensor is not None:
-        tensor.data.fill_(0)
-class CoorsNorm(nn.Module):
-    def __init__(self, eps = 1e-8):
-        super().__init__()
-        self.eps = eps
-        self.fn = nn.Sequential(nn.LayerNorm(1), nn.GELU())
-
-    def forward(self, coors):
-        norm = coors.norm(dim = -1, keepdim = True)
-        normed_coors = coors / norm.clamp(min = self.eps)
-        phase = self.fn(norm)
-        return (phase * normed_coors)
 
     
 class PEG_conv(MessagePassing):
@@ -64,9 +39,7 @@ class PEG_conv(MessagePassing):
             (default: :obj:`True`)
         bias (bool, optional): If set to :obj:`False`, the layer will not learn
             an additive bias. (default: :obj:`True`)
-        update_coors (bool): Whether to update positional encodings.
         use_formerinfo (bool): Whether to use previous layer's output to update node features.
-        norm_coors (bool): Whether to normalize positional encodings. Only used when update_coors = True. 
         **kwargs (optional): Additional arguments of
             :class:`torch_geometric.nn.conv.MessagePassing`.
     """
@@ -74,8 +47,7 @@ class PEG_conv(MessagePassing):
     def __init__(self, in_feats_dim: int, pos_dim: int, out_feats_dim: int, edge_mlp_dim: int = 32,
                  improved: bool = False, cached: bool = False,
                  add_self_loops: bool = True, normalize: bool = True,
-                 bias: bool = True, update_coors: bool = False,
-                 use_formerinfo: bool = False, norm_coors = True, **kwargs):
+                 bias: bool = True, use_formerinfo: bool = False, **kwargs):
 
         kwargs.setdefault('aggr', 'add')
         super(PEG_conv, self).__init__(**kwargs)
@@ -83,26 +55,23 @@ class PEG_conv(MessagePassing):
         self.in_feats_dim = in_feats_dim
         self.out_feats_dim = out_feats_dim
         self.pos_dim = pos_dim
-        self.update_coors = update_coors
         self.use_formerinfo = use_formerinfo
         self.improved = improved
         self.cached = cached
         self.add_self_loops = add_self_loops
         self.normalize = normalize
         self.edge_mlp_dim = edge_mlp_dim
-        self.coors_norm = CoorsNorm() if norm_coors else nn.Identity()
 
         self._cached_edge_index = None
         self._cached_adj_t = None
         
-        self.edge_mlp1 = nn.Linear(1, edge_mlp_dim)
-        self.edge_mlp2 = nn.Linear(edge_mlp_dim, 1)
         self.weight_withformer = Parameter(torch.Tensor(in_feats_dim + in_feats_dim, out_feats_dim))
         self.weight_noformer = Parameter(torch.Tensor(in_feats_dim, out_feats_dim))
-        self.coors_mlp = nn.Sequential(
-            nn.Linear(pos_dim, pos_dim * 4),
-            nn.Linear(pos_dim * 4, 1)
-        ) if update_coors else None
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(1, edge_mlp_dim),
+            nn.Linear(edge_mlp_dim, 1),
+            nn.Sigmoid()
+        )
 
         if bias:
             self.bias = Parameter(torch.Tensor(out_feats_dim))
@@ -152,13 +121,11 @@ class PEG_conv(MessagePassing):
         
         
         rel_coors = coors[edge_index[0]] - coors[edge_index[1]]
-        neighbour_coors = coors[edge_index[1]]
         rel_dist  = (rel_coors ** 2).sum(dim=-1, keepdim=True)
 
         # propagate_type: (x: Tensor, edge_weight: OptTensor)
         # pos: l2 norms
-        # rel_coors: used in updating positional encodings, not required for PEG
-        hidden_out, coors_out = self.propagate(edge_index, x = feats, edge_weight=edge_weight, pos=rel_dist, coors=coors, rel_coors=rel_coors, neighbour_coors = neighbour_coors,
+        hidden_out, coors_out = self.propagate(edge_index, x = feats, edge_weight=edge_weight, pos=rel_dist, coors=coors,
                              size=None)
         
         
@@ -170,9 +137,7 @@ class PEG_conv(MessagePassing):
 
 
     def message(self, x_i: Tensor, x_j: Tensor, edge_weight: OptTensor, pos) -> Tensor:
-        PE_edge_weight = self.edge_mlp1(pos)
-        PE_edge_weight = self.edge_mlp2(PE_edge_weight)
-        PE_edge_weight = torch.sigmoid(PE_edge_weight)
+        PE_edge_weight = self.edge_mlp(pos)
         return x_j if edge_weight is None else PE_edge_weight * edge_weight.view(-1, 1) * x_j
     
     def propagate(self, edge_index: Adj, size: Size = None, **kwargs):
@@ -198,16 +163,8 @@ class PEG_conv(MessagePassing):
 
         m_i = self.aggregate(m_ij, **aggr_kwargs)
         
-        # update coors if specified
-        if self.update_coors:
-            coor_wij = self.coors_mlp(m_ij)
-            kwargs["neighbour_coors"] = self.coors_norm(kwargs["neighbour_coors"])
-            mhat_i = self.aggregate(coor_wij * kwargs["neighbour_coors"], **aggr_kwargs)
-            coors_out = kwargs["coors"] + mhat_i
-        else:
-            coors_out = kwargs["coors"]
         
-        
+        coors_out = kwargs["coors"]
         hidden_feats = kwargs["x"]
         if self.use_formerinfo:
             hidden_out = torch.cat([hidden_feats, m_i], dim = -1)
@@ -222,8 +179,15 @@ class PEG_conv(MessagePassing):
         # return tuple
         return self.update((hidden_out, coors_out), **update_kwargs)
 
-    def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
-        return matmul(adj_t, x, reduce=self.aggr)
+    def glorot(tensor):
+        if tensor is not None:
+            stdv = math.sqrt(6.0 / (tensor.size(-2) + tensor.size(-1)))
+            tensor.data.uniform_(-stdv, stdv)
+
+        
+    def zeros(tensor):
+        if tensor is not None:
+            tensor.data.fill_(0)
 
     def __repr__(self):
         return '{}({}, {})'.format(self.__class__.__name__, self.in_channels,
