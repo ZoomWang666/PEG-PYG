@@ -81,9 +81,9 @@ class PEG_conv(MessagePassing):
         self.reset_parameters()
 
     def reset_parameters(self):
-        glorot(self.weight_withformer)
-        glorot(self.weight_noformer)
-        zeros(self.bias)
+        self.glorot(self.weight_withformer)
+        self.glorot(self.weight_noformer)
+        self.zeros(self.bias)
         self._cached_edge_index = None
         self._cached_adj_t = None
 
