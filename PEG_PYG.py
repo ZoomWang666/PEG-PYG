@@ -179,13 +179,13 @@ class PEG_conv(MessagePassing):
         # return tuple
         return self.update((hidden_out, coors_out), **update_kwargs)
 
-    def glorot(tensor):
+    def glorot(self, tensor):
         if tensor is not None:
             stdv = math.sqrt(6.0 / (tensor.size(-2) + tensor.size(-1)))
             tensor.data.uniform_(-stdv, stdv)
 
         
-    def zeros(tensor):
+    def zeros(self, tensor):
         if tensor is not None:
             tensor.data.fill_(0)
 
